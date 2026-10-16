@@ -77,6 +77,7 @@ static bool arg_resolvelazy = false;
 static bool arg_resolvedeps = false;
 static bool arg_hostonly = false;
 static bool arg_kerneldir = false;
+static bool arg_sysfw = false;
 static bool no_xattr = false;
 static char *destrootdir = NULL;
 static char *sysrootdir = NULL;
@@ -2001,6 +2002,93 @@ static int install_all(int argc, char **argv)
         return r;
 }
 
+static int install_firmware_fullpath(const char *fwpath, bool maybe_compressed);
+
+static bool sysfs_firmware_available(void)
+{
+        DIR *dir;
+        struct dirent *de;
+        bool found = false;
+
+        dir = opendir("/sys/class/firmware");
+        if (!dir)
+                return false;
+
+        while ((de = readdir(dir)) != NULL) {
+                if (strncmp(de->d_name, "requested", 9) == 0) {
+                        found = true;
+                        break;
+                }
+        }
+
+        closedir(dir);
+        return found;
+}
+
+static int install_sysfs_firmware(void)
+{
+        DIR *dir;
+        struct dirent *de;
+
+        dir = opendir("/sys/class/firmware");
+        if (!dir) {
+                log_debug("Cannot open /sys/class/firmware: %m");
+                return -1;
+        }
+
+        while ((de = readdir(dir)) != NULL) {
+                _cleanup_free_ char *fw_name = NULL;
+                _cleanup_free_ char *attr_path = NULL;
+                char **q;
+                bool found = false;
+
+                if (strncmp(de->d_name, "requested", 9) != 0)
+                        continue;
+
+                _asprintf(&attr_path, "/sys/class/firmware/%s", de->d_name);
+
+                {
+                        FILE *f = fopen(attr_path, "re");
+                        char buf[PATH_MAX];
+
+                        if (!f) {
+                                log_debug("Failed to read %s", attr_path);
+                                continue;
+                        }
+                        if (!fgets(buf, sizeof(buf), f)) {
+                                fclose(f);
+                                continue;
+                        }
+                        fclose(f);
+                        buf[strcspn(buf, "\n")] = '\0';
+                        fw_name = strdup(buf);
+                        if (!fw_name)
+                                continue;
+                }
+
+                if (!*fw_name)
+                        continue;
+
+                log_debug("Sysfs firmware: %s (from %s)", fw_name, attr_path);
+
+                STRV_FOREACH(q, firmwaredirs) {
+                        _cleanup_free_ char *fwpath = NULL;
+
+                        _asprintf(&fwpath, "%s/%s", *q, fw_name);
+                        if (install_firmware_fullpath(fwpath, true) == 0) {
+                                found = true;
+                                break;
+                        }
+                }
+                if (!found)
+                        log_info("Missing firmware %s (requested via %s)",
+                                 fw_name, attr_path);
+        }
+
+        closedir(dir);
+        return 0;
+}
+
 static int install_firmware_fullpath(const char *fwpath, bool maybe_compressed)
 {
         const char *fw = fwpath;
@@ -2351,7 +2439,8 @@ static int install_dependent_module(struct kmod_ctx *ctx, struct kmod_module *mo
                 _cleanup_kmod_module_unref_list_ struct kmod_list *modweak = NULL;
 #endif
                 log_debug("dracut_install '%s' '%s' OK", path, &path[kerneldirlen]);
-                install_firmware(mod);
+                if (!arg_sysfw)
+                        install_firmware(mod);
                 modlist = kmod_module_get_dependencies(mod);
                 *err = install_dependent_modules(ctx, modlist, suppliers_paths);
                 if (*err == 0) {
@@ -2473,7 +2562,8 @@ static int install_module(struct kmod_ctx *ctx, struct kmod_module *mod)
                         log_error("dracut_install '%s' ERROR", kmod_module_get_name(mod));
                 return ret;
         }
-        install_firmware(mod);
+        if (!arg_sysfw)
+                install_firmware(mod);
 
         Hashmap *suppliers = find_suppliers_paths_for_module(name);
         modlist = kmod_module_get_dependencies(mod);
@@ -2841,6 +2931,9 @@ static int install_modules(int argc, char **argv)
                 }
         }
 
+        if (arg_sysfw)
+                install_sysfs_firmware();
+
         return EXIT_SUCCESS;
 }
 
@@ -3056,6 +3149,11 @@ int main(int argc, char **argv)
         if (parse_dlopen_features() < 0) {
                 r = EXIT_FAILURE;
                 goto finish1;
+        }
+
+        if (arg_module && sysfs_firmware_available()) {
+                arg_sysfw = true;
+                log_debug("Sysfs requested firmware available, using them for hostonly firmware");
         }
 
         if (arg_module) {
